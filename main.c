@@ -6,7 +6,7 @@
  * Clock:        HSI 16MHz
  *
  * Peripherals / pins (TSSOP20):
- *   I2C      PB4=SDA PB5=SCL  -> hardware I2C slave, 7-bit addr 0x50
+ *   I2C      PB4=SCL PB5=SDA  -> bit-bang I2C slave (功能同硬件 I2C 定义), 7-bit addr 0x50
  *                               (open-drain + external 4.7k pull-ups)
  *   7-SEG    segments a..g,dp -> PA1 PA2 PA3 PC4 PC3 PC5 PC7 PC6 (active high)
  *            digits 1..4      -> PD3 PD2 PD1 PD4 (common cathode, active low)
@@ -117,6 +117,13 @@ static I2CS_t   i2c;                    /* hardware I2C slave (PB4/PB5) */
 static SEGLED_t seg;                    /* 4-digit common-cathode 7-seg */
 static UART_t   uart;                   /* UART1 debug link (PD5/PD6) */
 
+/* ---- TEMP DIAG: bus observability counters published by i2c_slave.c ---- */
+extern volatile uint8_t  g_bb_scl;      /* SCL level at last poll  */
+extern volatile uint8_t  g_bb_sda;      /* SDA level at last poll  */
+extern volatile uint16_t g_bb_edges;    /* SCL transitions seen    */
+extern volatile uint16_t g_bb_starts;   /* START conditions seen   */
+
+
 /* Global 1ms tick, incremented by TIM1 ISR */
 volatile uint16_t g_tick = 0;
 
@@ -217,9 +224,6 @@ static void demo_apply(void)
             i2c.tx_buf[i] = (uint8_t)' ';
         }
     }
-
-    /* Trace the step number over UART (debug convenience, 1 byte). */
-    uart.printf(&uart, "%c", (char)('1' + g_demo_step));
 }
 
 /* ========== DP Marquee Apply ==========
@@ -247,31 +251,112 @@ static void marquee_apply(void)
     }
 }
 
-static void i2c_on_write(I2CS_t *self)
+/* ========== 主机字符流 -> 数码管 ==========
+ * 主机把 UART 收到的每个字符原样转发过来，帧格式
+ *   { CMD_SET_DIGIT(0x10), pos, ch, 0x00 }   ch = ASCII 字符
+ * pos 字段从机一律忽略，排位完全由从机自己维护：
+ *   1) 复位后第一次收到字符：停掉 demo/marquee 动画，清空 4 位显示缓冲，
+ *      字符显示在最右（最低）位 digit4 (index 3)；
+ *   2) 之后的字符是 '.'：只把 dp 段叠加到刚才那一位（最右位），不移动内容；
+ *   3) 之后是可显示字符（SEGCODE_FromChar() 命中字符索引表）：
+ *      原内容整体右移一位 digit1<-digit2<-digit3<-digit4，新字符进最右位；
+ *   4) '\r'（回车）：清屏，4 位全灭，光标回到最右位 digit4，后续字符
+ *      重新从最右位开始排；
+ *   5) 其余字符表外的字符（空格 / LF 等，映射为 0x00）：忽略，显示不动。
+ * 所有动作只写扫描缓冲，函数内不阻塞。 */
+
+#define DISP_LAST    (I2C_DISP_LEN - 1u)   /* 最右（最低）位 digit4 */
+#define SEG_DP_BIT   0x80u
+
+static uint8_t g_disp_host = 0;            /* 0 = 主机尚未接管显示 */
+
+/* 清空 4 位显示缓冲：段码全灭，回读缓冲同步写空格。
+ * 只写 RAM 缓冲，不阻塞，可在 I2C/定时器上下文里调用。 */
+static void disp_clear(void)
 {
     uint8_t i;
 
-    /* Host data cancels the boot demo AND the dp marquee for good: both
-     * stop stepping and the received characters control the display from
-     * now on (no auto-resume, see demo / marquee state above). */
+    for (i = 0; i < I2C_DISP_LEN; i++) {
+        seg.digits[i] = DEMO_SEG_OFF;      /* 清空显示缓冲区 */
+        i2c.tx_buf[i] = (uint8_t)' ';      /* 主机回读同步 */
+    }
+}
+
+/* 首次接管：停动画 + 清显示缓冲 */
+static void disp_take_over(void)
+{
     g_demo_mode    = 0;
+    g_demo_step    = 0;
     g_demo_ms      = 0;
     g_marquee_mode = 0;
+    g_marquee_pos  = 0;
     g_marquee_ms   = 0;
 
-    /* Update the 4-digit display: map each received ASCII char. */
-    for (i = 0; i < 4; i++) {
-        uint8_t ch = self->rx_buf[i];
-        seg.setDigit(&seg, i, ch_to_disp(ch));
-        /* Keep tx_buf in sync: echo the original ASCII chars on master read. */
-        self->tx_buf[i] = ch;
+    disp_clear();
+
+    g_disp_host = 1;
+}
+
+static void disp_push_char(uint8_t ch)
+{
+    uint8_t code;
+    uint8_t i;
+
+    if (!g_disp_host) {
+        disp_take_over();
     }
 
-    uart.printf(&uart, "I2C WR: 0x%02X 0x%02X 0x%02X 0x%02X\r\n",
-                (unsigned int)self->rx_buf[0],
-                (unsigned int)self->rx_buf[1],
-                (unsigned int)self->rx_buf[2],
-                (unsigned int)self->rx_buf[3]);
+    if (ch == (uint8_t)'\r') {             /* 回车：清屏，光标回最右位 */
+        disp_clear();
+        return;
+    }
+
+    if (ch == (uint8_t)'.') {              /* 小数点：叠加到刚显示的那一位 */
+        seg.digits[DISP_LAST] |= SEG_DP_BIT;
+        return;
+    }
+
+    code = ch_to_disp(ch);
+    if (code == 0x00u) {                   /* 不在字符索引表：忽略 */
+        return;
+    }
+
+    for (i = 0; i + 1u < I2C_DISP_LEN; i++) {   /* 整体右移一位 */
+        seg.digits[i] = seg.digits[i + 1u];
+        i2c.tx_buf[i] = i2c.tx_buf[i + 1u];
+    }
+    seg.digits[DISP_LAST] = code;          /* 新字符进最右位 */
+    i2c.tx_buf[DISP_LAST] = ch;
+}
+
+static void i2c_on_write(I2CS_t *self)
+{
+    uint8_t cmd = self->rx_buf[0];
+
+    if (cmd == 0x10u) {                    /* 主机转发的一个字符 */
+        if (self->rx_len >= 3u) {
+            uint8_t ch = self->rx_buf[2];
+
+            /* 一律按原始 ASCII 处理。这里曾经有一段"旧协议数值 0..15
+             * 转回 '0'..'F'"的兼容分支，会把 0x0D('\r') 转成 'A'+3='D'、
+             * 把 0x0A('\n') 转成 'A'，导致清屏控制符被当成字符 'D' 显示。
+             * 旧主机已全部改发 ASCII，故该分支删除。 */
+            disp_push_char(ch);
+            /* '\r' 是清屏控制符，不回显控制字符，换成换行便于观察 */
+            uart.putc(&uart, (ch == (uint8_t)'\r') ? '\n' : (char)ch);
+        }
+        return;
+    }
+
+    if (cmd == 0x01u) {                    /* PING：绝不碰显示 */
+        self->tx_buf[0] = (uint8_t)'P';
+        self->tx_buf[1] = (uint8_t)'I';
+        self->tx_buf[2] = (uint8_t)'N';
+        self->tx_buf[3] = (uint8_t)'G';
+        return;
+    }
+
+    /* 未知帧：保持显示完全不变 */
 }
 
 /* ========== TIM1 1ms Time-Slice Timer (STM8S103) ========== */
@@ -368,12 +453,75 @@ void UART1_RX_IRQHandler(void) __interrupt(18)
     uart_rx_irq_handler();
 }
 
-/* ========== I2C ISR (hardware I2C slave) ==========
+/* ========== I2C ISR (unused) ==========
  * STM8S103F3 I2C vector = 0x8054 (IRQ 19) -> __interrupt(19).
- * Event + error interrupts share this vector; delegate to the driver. */
+ * The slave is now pure GPIO bit-bang (i2c_slave.c): the hardware I2C block
+ * stays disabled (PE=0, clock ungated), so this vector never fires. The
+ * stub is kept because the bit-bang slave polls the bus from the main loop
+ * instead of running inside an interrupt. */
 void I2C_IRQHandler(void) __interrupt(19)
 {
-    i2c.irq(&i2c);
+    i2c.irq(&i2c);              /* no-op stub */
+}
+
+/* ========== 兜底：PB 端口外部中断（int3） ==========================
+ * 向量表原本把 int3 填成 0x000000：只要 PB4/PB5 的 CR2（外部中断使能）
+ * 被置 1，总线抖动/静电/碰触金属产生的边沿就会把 PC 打进 0x000000，
+ * 表现为整机死锁（数码管停在一位、串口静默、只能断电恢复）。
+ * 这里挂一个只做 iret 的空处理程序，从根上消除"跳 0 死机"这条路径；
+ * 同时 PB4/PB5 的 CR2 已在 i2cs_init / pin_selftest 里强制清零。
+ * 编号说明：SDCC 的 __interrupt(N) 槽地址 = 0x8008 + 4N，而 STM8 的 IRQ n
+ * 在 0x800C + 4n，故 N = n + 1。Port B = EXTI1 = IRQ3 -> __interrupt(4)
+ * （同法可验：TIM1_UPD = IRQ10 -> 11、UART1_RX = IRQ17 -> 18、I2C = IRQ18 -> 19）。 */
+void PB_EXTI_IRQHandler(void) __interrupt(4)
+{
+    /* 不读 IDR、不清任何标志，直接返回。EXTI 无锁存标志位。 */
+}
+
+/* ========== TEMP DIAG: PB4/PB5 pin controllability self-test ==========
+ * 接线、共地、4.7k 上拉三项均已确认无误，但从机侧 g_bb_edges 每次事务
+ * 只 +2，说明 PB5(SCL) 的电平翻转根本没有被采到。必须先区分两种可能：
+ *   (a) 引脚受 GPIO 控制，只是主机信号没到  -> 主动拉低能读回 0
+ *   (b) 引脚不受 GPIO 控制（选项字节 AFR 把 I2C 复用走了，或引脚仍被
+ *       I2C 外设占住）                      -> 主动拉低后读回仍是 1
+ * 做法：把 SCL 临时设为开漏输出并驱动低，忙等一会儿后读 IDR；再释放
+ * 读一次（验外部上拉是否真的存在）。SDA 同理。
+ * 打印格式：#SELFTEST scl_low=x scl_rel=x sda_low=x sda_rel=x
+ *   *_low=0 -> 拉低成功（引脚可控）    *_low=1 -> 拉不低（引脚不可控/短路到 3V3）
+ *   *_rel=1 -> 释放后回高（上拉有效）  *_rel=0 -> 释放后仍低（被别处拉死）
+ */
+static uint8_t g_st_scl_low, g_st_scl_rel, g_st_sda_low, g_st_sda_rel;
+
+static void pin_selftest(void)
+{
+    volatile uint16_t d;
+
+    /* ---- SCL / PB4 (第12脚): switch to open-drain output, drive low ----
+     * CR2 是 GPIO 外部中断使能位，此处必须清零（&= ~），绝不能置 1：
+     * 它是整机 HOLD 的根因 —— 置 1 后任何边沿都会打进空的 Port B 向量。 */
+    GPIO_PB_ODR &= (uint8_t)~I2C_SCL_PIN;
+    GPIO_PB_DDR |=  I2C_SCL_PIN;
+    GPIO_PB_CR1 &= (uint8_t)~I2C_SCL_PIN;
+    GPIO_PB_CR2 &= (uint8_t)~I2C_SCL_PIN;
+    for (d = 0u; d < 40000u; d++) { ; }
+    g_st_scl_low = (GPIO_PB_IDR & I2C_SCL_PIN) ? 1u : 0u;
+
+    /* release and read back, then restore pure-input configuration */
+    GPIO_PB_ODR |= I2C_SCL_PIN;
+    for (d = 0u; d < 40000u; d++) { ; }
+    g_st_scl_rel = (GPIO_PB_IDR & I2C_SCL_PIN) ? 1u : 0u;
+    GPIO_PB_DDR &= (uint8_t)~I2C_SCL_PIN;
+    GPIO_PB_CR2 &= (uint8_t)~I2C_SCL_PIN;
+
+    /* ---- SDA / PB5 (第11脚): already open-drain output, just toggle ODR ---- */
+    GPIO_PB_CR2 &= (uint8_t)~I2C_SDA_PIN;   /* 不许开 PB5 输入中断 */
+    GPIO_PB_ODR &= (uint8_t)~I2C_SDA_PIN;
+    for (d = 0u; d < 40000u; d++) { ; }
+    g_st_sda_low = (GPIO_PB_IDR & I2C_SDA_PIN) ? 1u : 0u;
+
+    GPIO_PB_ODR |= I2C_SDA_PIN;
+    for (d = 0u; d < 40000u; d++) { ; }
+    g_st_sda_rel = (GPIO_PB_IDR & I2C_SDA_PIN) ? 1u : 0u;
 }
 
 /* ========== Main Entry ========== */
@@ -390,7 +538,7 @@ int main(void)
     /* Init peripherals */
     uart.init(&uart);               /* UART1 115200 8N1, TX PD5 / RX PD6 */
     seg.init(&seg);                 /* 12 GPIO outputs for 4x7-seg */
-    i2c.init(&i2c);                 /* I2C slave 0x50, PB4=SDA PB5=SCL */
+    i2c.init(&i2c);                 /* I2C slave 0x50, PB4=SCL PB5=SDA */
 
     /* Bind I2C write callback (display update + debug print). */
     i2c.onWrite = &i2c_on_write;
@@ -400,7 +548,9 @@ int main(void)
 
     /* Print the ready banner first so it is not delayed by the demo's
      * per-step UART trace (demo_apply() enqueues one char on UART). */
-    uart.puts(&uart, "STM8S103 I2C SLAVE + 4x7SEG ready\r\n");
+    uart.puts(&uart, "SLAVE ready\r\n");
+
+    pin_selftest();
 
     /* Start the boot demo immediately: g_demo_step = 0 -> only digit 4, the
      * rightmost / LOW digit, is lit ("    8."). Every DEMO_STEP_MS the TIM1
@@ -410,19 +560,24 @@ int main(void)
      * digit1, i.e. low to high, every MARQUEE_STEP_MS). */
     demo_apply();
 
-    /* Event-driven main loop with buffered UART TX and RX echo.
-     * NOTE: 不能用 halt（TIM1 无法唤醒 halt）；用 wfi：CPU 暂停但外设时钟
-     * 继续，任何中断（含 TIM1 1ms / I2C / UART1 RX）唤醒后自动进入 ISR。 */
-    while (1) {
-        /* Drain pending TX bytes */
-        uart.tx_service(&uart);
+    /* Main loop: the I2C slave is a SOFTWARE bit-bang implementation and
+     * has to be polled continuously, so wfi/halt must NOT be used here --
+     * either one would sleep through the START condition and every SCL
+     * edge. UART service is throttled to every 16th poll so the polling
+     * rate stays high enough for the bit timing. */
+    {
+        uint8_t svc = 0;
 
-        /* UART RX echo */
-        if (uart.rx_flag) {
-            uart.rx_flag = 0;
-            uart.putc(&uart, (char)uart.rx_byte);
+        while (1) {
+            i2c.poll(&i2c);         /* sample SCL/SDA, run the bit state machine */
+
+            if (++svc >= 16u) {
+                svc = 0;
+
+                /* Drain pending TX bytes */
+                uart.tx_service(&uart);
+            }
         }
-        __asm__("wfi");             /* wait-for-interrupt */
     }
 
     // return 0;

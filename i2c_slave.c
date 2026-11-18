@@ -1,178 +1,353 @@
 /**
- * i2c_slave.c - STM8S I2C Slave Driver Implementation (Object-Oriented)
+ * i2c_slave.c - STM8S I2C Slave, SOFTWARE BIT-BANG (polled) implementation
  *
- * Hardware notes (STM8S103F3P6):
- *   - I2C pins: PB4 = SDA, PB5 = SCL (hardware I2C, open-drain)
- *   - Slave address is 7-bit, programmed into OARL = addr7 << 1
- *   - Bus speed is provided by the master; CCR is not programmed in
- *     slave mode (kept at reset value, documented for clarity)
- *   - The ISR body runs in the I2C vector (IRQ 19) defined in main.c;
- *     call i2c.irq(&i2c) from that vector stub.
+ * Why bit-bang?
+ *   Both project3 (slave) and project4 (master) sit on STM8S103F3P6 with
+ *   PB4=SCL / PB5=SDA — 与 STM8S103 硬件 I2C 外设的默认映射完全一致。 The hardware I2C block on these parts is mapped via
+ *   the AFR option byte; when it is remapped to PC1/PC2 (not bonded out on
+ *   TSSOP20) the block keeps PB4/PB5 as plain GPIO. The old init() did
+ *   DDR=1 + CR1=0 + ODR(reset)=0, i.e. it turned both lines into open-drain
+ *   outputs driving 0 -> the slave held SCL/SDA low forever and the master
+ *   could only ever report TIMEOUT. This driver never touches the I2C
+ *   peripheral at all.
  *
- * Transaction state machine:
- *   IDLE     - waiting for address match
- *   RX_DATA  - master is writing bytes to us (accumulate in rx_buf)
- *   TX_DATA  - master is reading bytes from us (stream tx_buf)
+ * Pin usage (bit-bang，功能与硬件 I2C 定义一致：PB4=SCL / PB5=SDA):
+ *   PB5 SDA : open-drain OUTPUT (DDR=1, CR1=0, CR2=0).
+ *             ODR=1 -> released (external 4.7k pulls high); ODR=0 -> drive low.
+ *   PB4 SCL : pure INPUT (DDR=0, CR1=0 = floating, external 4.7k pull-up).
+ *             A slave must never drive the clock, so a stuck SCL is
+ *             physically impossible with this configuration.
+ *   Reading GPIO_PB_IDR always returns the real bus level, so the open-drain
+ *   SDA can be sampled even while configured as an output.
  *
- * A full 4-byte write payload (display digits) triggers onWrite at the
- * STOP condition, so the application sees one consistent update per
- * I2C transaction. Master-read returns the current tx_buf (initialised
- * to the displayed digits), followed by 0x00 padding until NACK.
+ * Timing model:
+ *   There are no external interrupts involved. i2cs_poll() is called from the
+ *   main loop as fast as possible and derives every event from SCL/SDA level
+ *   changes (rising edge -> sample, falling edge -> change SDA). At 16MHz HSI
+ *   one poll costs only a few instructions. The TIM1 1ms display ISR does
+ *   steal some cycles, therefore the master (project4) is configured to
+ *   ~25kHz SCL (BB_HALF_PERIOD = 28), which leaves ample margin.
+ *
+ * Transaction state machine (phases, driven purely by bus edges):
+ *   IDLE      - waiting for START
+ *   ADDR      - shifting in 7-bit address + R/W bit
+ *   ADDR_ACK  - drive ACK low on the falling edge
+ *   ADDR_ACK2 - ack clock finished: release, load first byte if master reads
+ *   RX        - shifting in a data byte
+ *   RX_ACK    - drive ACK low on the falling edge
+ *   RX_ACK2   - ack clock finished: release, next byte
+ *   TX        - driving a data byte (MSB first, changes on falling edges)
+ *   TX_ACK    - sampling the master ACK (low) / NACK (high)
+ *   WAIT_STOP - not addressed or NACKed: ignore everything until STOP/START
  */
 
 #include <stdint.h>
 #include "i2c_slave.h"
 
-/* ========== Internal state codes ========== */
+/* ========== 关于 MCU HOLD 的修复（已定位并根治，勿回退） ==========
+ * 根因不在硬件、也不在 bit-bang 采样路径，而是 PB4/PB5 的 CR2（GPIO 外部
+ * 中断使能）被置 1：向量表 int4（Port B）原为 0x000000，任何边沿都会把 PC
+ * 打进空向量死锁。现已（a）挂上 PB_EXTI_IRQHandler 兜底、（b）两脚 CR2 强制
+ * 清零。隔离测试开关 BB_PB5_RX_OFF 已移除。
+ * ================================================================= */
+/* Suppress SDCC warning 110 (unsupported #pragma) coming from the device header */
+#pragma disable_warning 110
+
+/* ========== Transaction state codes (same as the hardware version) ========== */
 #define I2CS_STATE_IDLE      0
 #define I2CS_STATE_RX_DATA   1
 #define I2CS_STATE_TX_DATA   2
+
+/* ========== Bit-bang phases ========== */
+#define BB_PH_IDLE       0u
+#define BB_PH_ADDR       1u
+#define BB_PH_ADDR_ACK   2u
+#define BB_PH_ADDR_ACK2  3u
+#define BB_PH_RX         4u
+#define BB_PH_RX_ACK     5u
+#define BB_PH_RX_ACK2    6u
+#define BB_PH_TX         7u
+#define BB_PH_TX_ACK     8u
+#define BB_PH_WAIT_STOP  9u
+
+/* ========== Line helpers ========== */
+#define SDA_HIGH()     (GPIO_PB_ODR |=  (uint8_t)I2C_SDA_PIN)
+#define SDA_LOW()      (GPIO_PB_ODR &= (uint8_t)~(uint8_t)I2C_SDA_PIN)
+
+/* Module-private state (single instance on STM8S103). */
+static uint8_t bb_ph;      /* current phase */
+static uint8_t bb_bit;     /* bits handled in this phase (0..8) */
+static uint8_t bb_sh;      /* shift register */
+static uint8_t bb_rd;      /* 1 = master reads (slave transmits) */
+static uint8_t bb_pcl;     /* SCL level of the previous poll */
+static uint8_t bb_pda;     /* SDA level of the previous poll */
+
+/* ---- TEMP DIAG: bus observability counters (read by main.c) ----
+ * g_bb_scl / g_bb_sda : last sampled bus levels (1 = high)
+ * g_bb_edges          : number of SCL transitions seen (any edge)
+ * g_bb_starts         : number of START conditions recognised
+ * These tell apart "slave cannot see the bus at all" (edges stuck at 0,
+ * wiring / pull-up problem) from "edges arrive but START never detected"
+ * (SDA sampled stuck high) from "frame received, address mismatch". */
+volatile uint8_t  g_bb_scl    = 0;
+volatile uint8_t  g_bb_sda    = 0;
+volatile uint16_t g_bb_edges  = 0;
+volatile uint16_t g_bb_starts = 0;
+
+/* ========== Byte transfer helpers ========== */
+
+/* Load the next byte into the shift register. When the payload is
+ * exhausted, 0x00 is sent as padding until the master answers NACK. */
+static void bb_tx_load(I2CS_t *self)
+{
+    if (self->tx_pos < self->tx_len) {
+        bb_sh = self->tx_buf[self->tx_pos++];
+    } else {
+        bb_sh = 0x00;
+    }
+}
+
+/* Drive the MSB onto SDA and advance the shift register. Called on a
+ * falling edge so the level is stable when the master samples it. */
+static void bb_tx_put_bit(void)
+{
+    if (bb_sh & 0x80u) {
+        SDA_HIGH();
+    } else {
+        SDA_LOW();
+    }
+    bb_sh = (uint8_t)(bb_sh << 1);
+    bb_bit++;
+}
+
+/* START (or repeated START): resynchronise and expect a new address. */
+static void bb_start(I2CS_t *self)
+{
+    g_bb_starts++;
+    SDA_HIGH();
+    bb_ph  = BB_PH_ADDR;
+    bb_bit = 0;
+    bb_sh  = 0;
+    bb_rd  = 0;
+    self->rx_len = 0;
+    self->tx_pos = 0;
+    self->state  = I2CS_STATE_IDLE;
+}
+
+/* STOP: the transaction is complete; hand the payload to the application. */
+static void bb_stop(I2CS_t *self)
+{
+    SDA_HIGH();
+    if (self->write_pending && self->onWrite) {
+        self->onWrite(self);      /* one consistent 4-digit update */
+    }
+    self->write_pending = 0;
+    self->rx_len        = 0;
+    self->tx_pos        = 0;
+    self->state         = I2CS_STATE_IDLE;
+    bb_ph               = BB_PH_IDLE;
+    bb_bit              = 0;
+    bb_sh               = 0;
+}
 
 /* ========== I2C Slave Method Implementations ========== */
 
 static void i2cs_init(I2CS_t *self)
 {
-    /* Peripheral clock: bit5 = I2CEN. uart_init() already wrote 0xFF,
-     * but keep the explicit gate so this module is self-contained. */
-    CLK_PCKENR1 |= CLK_PCKENR1_I2CEN;
+    /* 1) Release both lines BEFORE enabling any output driver. ODR resets to
+     *    0x00, so setting DDR first would immediately pull SDA/SCL low and
+     *    stall the master -- exactly the failure seen with the HW version. */
+    GPIO_PB_ODR |= (uint8_t)(I2C_SDA_PIN | I2C_SCL_PIN);
 
-    /* PB4 = SDA, PB5 = SCL: open-drain outputs (CR1=0). The STM8S I2C
-     * alternate function needs DDR=1 to reach the pin; external 4.7k
-     * pull-ups are required on both lines. */
-    GPIO_PB_DDR |= (I2C_SDA_PIN | I2C_SCL_PIN);
-    GPIO_PB_CR1 &= (uint8_t)~(I2C_SDA_PIN | I2C_SCL_PIN); /* open-drain */
-    GPIO_PB_CR2 |= (I2C_SDA_PIN | I2C_SCL_PIN);           /* 10MHz slew */
+    /* 2) SDA open-drain output, SCL plain input (see file header). */
+    GPIO_PB_CR1 &= (uint8_t)~(uint8_t)(I2C_SDA_PIN | I2C_SCL_PIN);
+    GPIO_PB_DDR |=  (uint8_t)I2C_SDA_PIN;                /* PB5 SDA = 开漏输出 */
+    GPIO_PB_DDR &= (uint8_t)~(uint8_t)I2C_SCL_PIN;       /* PB4 SCL = 纯输入，从机不驱动时钟 */
 
-    /* Software-reset the I2C peripheral first (clean state). */
-    I2C_CR1 |= I2C_CR1_SWRST;
-    I2C_CR1 &= (uint8_t)~I2C_CR1_SWRST;
+    /* 3) CR2 = GPIO 外部中断使能位（与 DDR 无关）。本工程中断向量表里
+     *    int3 = PB 端口 = 0x000000，一旦 PB4/PB5 的 CR2 被置 1，总线或
+     *    静电产生的边沿就会把 PC 打进 0x000000 -> MCU 死锁(HOLD)（已实战复现并验证）。
+     *    因此两脚的 CR2 一律保持 0，绝不允许开输入中断。 */
+    GPIO_PB_CR2 &= (uint8_t)~(uint8_t)(I2C_SDA_PIN | I2C_SCL_PIN);
 
-    /* Input clock frequency = 16MHz (HSI), FREQ[5:0] = 0x10. */
-    I2C_FREQR = 0x10;
+    /* 3) The I2C peripheral is not used and its clock is left ungated: with
+     *    PE=0 (reset value) the block can never fight the GPIO driver, no
+     *    matter how the AFR option byte maps it. */
 
-    /* 7-bit slave address: OARL = addr7 << 1, OARH bit7 (ADDMODE) = 0.
-     * Example: 0x50 -> OARL = 0xA0. */
-    I2C_OARH = 0x00;                        /* 7-bit mode */
-    I2C_OARL = (uint8_t)(self->addr7 << 1);
+    /* 4) Reset the polling state machine from the real bus levels. */
+    bb_ph  = BB_PH_IDLE;
+    bb_bit = 0;
+    bb_sh  = 0;
+    bb_rd  = 0;
+    bb_pcl = (GPIO_PB_IDR & I2C_SCL_PIN) ? 1u : 0u;
+    bb_pda = (GPIO_PB_IDR & I2C_SDA_PIN) ? 1u : 0u;
 
-    /* No general call, no SMBus alert. */
-    I2C_CR1 &= (uint8_t)~(I2C_CR1_ENGC);
-
-    /* Enable event + buffer + error interrupts. */
-    I2C_CR2 |= (I2C_CR2_ITEVTEN | I2C_CR2_ITBUFEN | I2C_CR2_ITERREN);
-
-    /* Enable error interrupt sources (bus error / arbitration lost /
-     * NACK / overrun), so AF (master NACK at end of read) is serviced. */
-    I2C_ITCR |= (I2C_ITCR_BERRIE | I2C_ITCR_ARLOIE |
-                 I2C_ITCR_AFIE | I2C_ITCR_OVRIE);
-
-    /* Enable the peripheral and slave ACK. */
-    I2C_CR1 |= (I2C_CR1_PE | I2C_CR1_ACK);
-
-    /* Clear residual flags by reading SR1/SR3. */
-    (void)I2C_SR1;
-    (void)I2C_SR2;
-    (void)I2C_SR3;
-
-    /* Reset transaction state. */
-    self->state        = I2CS_STATE_IDLE;
-    self->rx_len       = 0;
-    self->tx_pos       = 0;
-    self->tx_len       = I2C_DISP_LEN;   /* master reads 4 display digits */
+    self->state         = I2CS_STATE_IDLE;
+    self->rx_len        = 0;
+    self->tx_pos        = 0;
+    self->tx_len        = I2C_DISP_LEN;   /* master reads 4 display digits */
     self->write_pending = 0;
 }
 
+/* Legacy hook: the hardware I2C vector never fires any more. Kept so that
+ * main.c's I2C_IRQHandler() still links against a valid symbol. */
 static void i2cs_irq(I2CS_t *self)
 {
-    uint8_t sr1 = I2C_SR1;
+    (void)self;
+}
 
-    /* ---- 1. Error handling (read SR3, clear via ITR) ---- */
-    if (I2C_SR3 & (I2C_SR3_BERR | I2C_SR3_ARLO | I2C_SR3_AF | I2C_SR3_OVR)) {
-        uint8_t err = I2C_SR3;
-        if (err & I2C_SR3_AF) {
-            /* Master NACK: read transfer finished (or address NACK). */
-            if (self->state == I2CS_STATE_TX_DATA) {
-                self->state = I2CS_STATE_IDLE;
-            }
-            I2C_ITR = I2C_ITR_AF;   /* write 1 clears AF */
+/**
+ * Poll the bus. Must be called in a tight loop from main(); never call wfi,
+ * otherwise the START condition and all clock edges are missed.
+ *
+ * Each call: read both lines, detect START/STOP (SDA moves while SCL high),
+ * then handle an SCL rising edge (sample) or falling edge (drive SDA).
+ */
+static void i2cs_poll(I2CS_t *self)
+{
+    uint8_t idr = GPIO_PB_IDR;
+    uint8_t scl = (idr & I2C_SCL_PIN) ? 1u : 0u;
+    uint8_t sda = (idr & I2C_SDA_PIN) ? 1u : 0u;
+    /* Classify this poll explicitly instead of testing chained booleans:
+     *   st = (scl << 1) | bb_pcl -> 3 = high&high, 2 = rising, 1 = falling,
+     *                                0 = low&low (nothing to do)
+     * An explicit code stops SDCC rewriting the short-circuit chain
+     * (warning 110) and documents the edge detection. */
+    uint8_t st = (uint8_t)((scl << 1) | bb_pcl);
+
+    /* TEMP DIAG: publish the levels and count real SCL transitions. */
+    g_bb_scl = scl;
+    g_bb_sda = sda;
+    if (st == 2u || st == 1u) {
+        g_bb_edges++;
+    }
+
+    /* ---------- START / repeated START / STOP ---------- */
+    if (st == 3u) {
+        if (bb_pda && !sda) {                 /* SDA fell while SCL high */
+            bb_start(self);
+            bb_pcl = scl;
+            bb_pda = sda;
+            return;
         }
-        if (err & I2C_SR3_BERR) {
-            self->state = I2CS_STATE_IDLE;
-            I2C_ITR = I2C_ITR_BERR;
-        }
-        if (err & I2C_SR3_ARLO) {
-            self->state = I2CS_STATE_IDLE;
-            I2C_ITR = I2C_ITR_ARLO;
-        }
-        if (err & I2C_SR3_OVR) {
-            I2C_ITR = I2C_ITR_OVR;
+        if (!bb_pda && sda) {                 /* SDA rose while SCL high */
+            bb_stop(self);
+            bb_pcl = scl;
+            bb_pda = sda;
+            return;
         }
     }
 
-    /* ---- 2. Address matched (EV1) ---- */
-    if (sr1 & I2C_SR1_ADDR) {
-        (void)I2C_SR2;              /* read SR2 clears ADDR */
-        self->rx_len = 0;
-        self->tx_pos = 0;
+    if (st == 2u) {
+        /* ===== SCL rising edge: the bus data is valid, sample it ===== */
+        switch (bb_ph) {
+        case BB_PH_ADDR:
+            bb_sh = (uint8_t)((bb_sh << 1) | sda);
+            if (++bb_bit >= 8u) {
+                bb_bit = 0;
+                bb_rd  = (uint8_t)(bb_sh & 0x01u);      /* R/W bit */
+                if ((uint8_t)(bb_sh >> 1) == self->addr7) {
+                    self->rx_len = 0;
+                    self->tx_pos = 0;
+                    bb_ph = BB_PH_ADDR_ACK;
+                } else {
+                    SDA_HIGH();                     /* not for us, no ACK */
+                    bb_ph = BB_PH_WAIT_STOP;
+                }
+            }
+            break;
 
-        if (I2C_SR2 & I2C_SR2_TX) {
-            /* Master reads: we transmit. Give the app a chance to
-             * refresh tx_buf, then start with the first byte. */
-            self->state = I2CS_STATE_TX_DATA;
-            if (self->onRequest) {
-                self->onRequest(self);
+        case BB_PH_RX:
+            bb_sh = (uint8_t)((bb_sh << 1) | sda);
+            if (++bb_bit >= 8u) {
+                bb_bit = 0;
+                if (self->rx_len < I2C_BUF_SIZE) {
+                    self->rx_buf[self->rx_len++] = bb_sh;
+                }
+                if (self->rx_len >= I2C_DISP_LEN) {
+                    self->write_pending = 1;        /* full display payload */
+                }
+                bb_sh = 0;
+                bb_ph = BB_PH_RX_ACK;               /* ACK on next fall */
             }
-            if (self->tx_len == 0) {
-                self->tx_len = I2C_DISP_LEN;   /* safety default */
+            break;
+
+        case BB_PH_TX_ACK:
+            if (sda) {                              /* NACK: payload done */
+                SDA_HIGH();
+                bb_ph = BB_PH_WAIT_STOP;
+            } else {                                /* ACK: send next byte */
+                bb_bit = 0;
+                bb_tx_load(self);
+                bb_ph = BB_PH_TX;
             }
-            if (I2C_SR1 & I2C_SR1_TXE) {       /* TXE already set? */
-                I2C_DR = self->tx_buf[0];
-                self->tx_pos = 1;
-            }
-        } else {
-            /* Master writes: we receive. */
-            self->state = I2CS_STATE_RX_DATA;
+            break;
+
+        default:
+            /* ADDR_ACK / ADDR_ACK2 / RX_ACK / RX_ACK2 / TX: nothing to
+             * sample on this edge. */
+            break;
         }
-    }
+    } else if (st == 1u) {
+        /* ===== SCL falling edge: change SDA for the next bit ===== */
+        switch (bb_ph) {
+        case BB_PH_ADDR_ACK:
+            SDA_LOW();                              /* ACK the address */
+            bb_ph = BB_PH_ADDR_ACK2;
+            break;
 
-    /* ---- 3. TXE: transmit register empty, master is reading ---- */
-    if (sr1 & I2C_SR1_TXE) {
-        if (self->state == I2CS_STATE_TX_DATA) {
-            if (self->tx_pos < self->tx_len) {
-                I2C_DR = self->tx_buf[self->tx_pos++];
+        case BB_PH_ADDR_ACK2:
+            SDA_HIGH();                             /* ack clock finished */
+            if (bb_rd) {
+                self->state = I2CS_STATE_TX_DATA;
+                /* NOTE: onRequest runs here and MUST be very short (fill
+                 * tx_buf only) -- the master's first data clock follows
+                 * immediately. Unbound in project3, so no risk. */
+                if (self->onRequest) {
+                    self->onRequest(self);
+                }
+                bb_bit = 0;
+                bb_tx_load(self);
+                bb_tx_put_bit();                    /* MSB straight away */
+                bb_ph = BB_PH_TX;
             } else {
-                I2C_DR = 0x00;      /* payload exhausted: pad until NACK */
+                self->state = I2CS_STATE_RX_DATA;
+                bb_sh  = 0;
+                bb_bit = 0;
+                bb_ph  = BB_PH_RX;
             }
+            break;
+
+        case BB_PH_RX_ACK:
+            SDA_LOW();                              /* ACK the received byte */
+            bb_ph = BB_PH_RX_ACK2;
+            break;
+
+        case BB_PH_RX_ACK2:
+            SDA_HIGH();
+            bb_sh  = 0;
+            bb_bit = 0;
+            bb_ph  = BB_PH_RX;
+            break;
+
+        case BB_PH_TX:
+            if (bb_bit < 8u) {
+                bb_tx_put_bit();
+            } else {
+                SDA_HIGH();                         /* 8 bits done: let the
+                                                     * master drive ACK */
+                bb_ph = BB_PH_TX_ACK;
+            }
+            break;
+
+        case BB_PH_WAIT_STOP:
+        default:
+            break;
         }
     }
 
-    /* ---- 4. RXNE: receive register not empty, master is writing ---- */
-    if (sr1 & I2C_SR1_RXNE) {
-        uint8_t b = I2C_DR;         /* reading DR clears RXNE */
-        if (self->state == I2CS_STATE_RX_DATA) {
-            if (self->rx_len < I2C_BUF_SIZE) {
-                self->rx_buf[self->rx_len++] = b;
-            }
-            if (self->rx_len >= I2C_DISP_LEN) {
-                self->write_pending = 1;   /* full display payload seen */
-            }
-        }
-        /* In any other state: byte consumed and discarded. */
-    }
-
-    /* ---- 5. STOPF: master sent STOP, transaction finished ---- */
-    if (sr1 & I2C_SR1_STOPF) {
-        self->state = I2CS_STATE_IDLE;
-        if (self->write_pending && self->onWrite) {
-            self->onWrite(self);    /* consistent 4-digit update */
-        }
-        self->write_pending = 0;
-        self->rx_len = 0;
-        /* Clear STOPF: read SR1 (done above), then set STOP bit in CR1
-         * (in slave mode this clears the flag, does not emit STOP). */
-        I2C_CR1 |= I2C_CR1_STOP;
-        I2C_CR1 &= (uint8_t)~I2C_CR1_STOP;
-    }
+    bb_pcl = scl;
+    bb_pda = sda;
 }
 
 /* ========== I2C Slave Constructor ========== */
@@ -190,7 +365,7 @@ I2CS_t I2CS_Create(uint16_t base, uint8_t addr7)
     i2c.tx_len        = I2C_DISP_LEN;
     i2c.write_pending = 0;
 
-    /* Default TX payload: ASCII "0000" — mirrors the boot-demo start
+    /* Default TX payload: ASCII "0000" -- mirrors the boot-demo start
      * character '0' (main.c demo_apply() keeps it in sync while the demo
      * rolls; an I2C write replaces it with the host payload). */
     i2c.tx_buf[0] = '0';
@@ -205,6 +380,7 @@ I2CS_t I2CS_Create(uint16_t base, uint8_t addr7)
     /* Bind methods. */
     i2c.init      = i2cs_init;
     i2c.irq       = i2cs_irq;
+    i2c.poll      = i2cs_poll;
 
     /* No callbacks by default; app binds after Create(). */
     i2c.onWrite   = 0;

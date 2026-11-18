@@ -1,4 +1,4 @@
-/**
+﻿/**
  * uart.c - STM8S UART1 Driver Implementation (Object-Oriented)
  *
  * Hardware notes (STM8S103F3P6):
@@ -79,10 +79,8 @@ static void uart_init(UART_t *self)
 
 /* ========== UART1 RX Interrupt Helper ==========
  * STM8S103F3 UART1_RX vector = 0x8050 (IRQ 18).
- * NOTE: SDCC 4.5.0 stm8 后端只在"含 main 的编译单元"生成 __interrupt_vect
- * 向量表，且只收录该单元内定义的 __interrupt 函数。因此这里改为普通处理
- * 函数，由 main 单元的 UART1_RX_IRQHandler __interrupt(18) 向量壳调用。
- * Non-blocking: read DR into the UART_t instance, set rx_flag,
+ * NOTE: SDCC 4.5.0 stm8 鍚庣鍙湪"鍚?main 鐨勭紪璇戝崟鍏?鐢熸垚 __interrupt_vect
+ * 鍚戦噺琛紝涓斿彧鏀跺綍璇ュ崟鍏冨唴瀹氫箟鐨?__interrupt 鍑芥暟銆傚洜姝よ繖閲屾敼涓烘櫘閫氬鐞? * 鍑芥暟锛岀敱 main 鍗曞厓鐨?UART1_RX_IRQHandler __interrupt(18) 鍚戦噺澹宠皟鐢ㄣ€? * Non-blocking: read DR into the UART_t instance, set rx_flag,
  * leave the actual echo to the main loop. */
 void uart_rx_irq_handler(void)
 {
@@ -120,20 +118,23 @@ static void uart_putc(UART_t *self, char c)
     self->tx_head = next;       /* publish AFTER the byte is in the buffer */
 }
 
-/* ========== TX Drain (called from the main loop, blocking) ========== */
+/* ========== TX Drain (called from the main loop, non-blocking) ========== */
 static void uart_tx_service(UART_t *self)
 {
-    while (self->tx_head != self->tx_tail) {
-        uint16_t guard = 0xFFFF;
-        while (!(UART1_SR & UART1_SR_TXE)) {
-            if (--guard == 0) {
-                return;         /* give up: transmitter stuck */
-            }
-        }
-        uint8_t b = self->tx_buf[self->tx_tail];
-        self->tx_tail = (uint8_t)((self->tx_tail + 1) & (TX_BUF_SIZE - 1));
-        UART1_DR = b;
+    /* NON-BLOCKING: move at most ONE byte per call.
+     * The old drain loop waited for every pending byte to leave the shifter
+     * (up to ~3ms for a 35-char line at 115200), during which the main loop
+     * could not poll the software bit-bang I2C slave -- the host's whole
+     * frame was then missed and reported as NACK. Polling the I2C bus has
+     * priority, so the UART is fed one byte at a time from the main loop. */
+    if (self->tx_head == self->tx_tail) {
+        return;                 /* nothing pending */
     }
+    if (!(UART1_SR & UART1_SR_TXE)) {
+        return;                 /* shifter busy: retry on the next poll */
+    }
+    UART1_DR = self->tx_buf[self->tx_tail];
+    self->tx_tail = (uint8_t)((self->tx_tail + 1) & (TX_BUF_SIZE - 1));
 }
 
 static void uart_puts(UART_t *self, const char *s)

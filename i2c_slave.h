@@ -5,8 +5,8 @@
  * abstraction with method binding, mirroring the OO style of
  * project2 (LED_t / UART_t). Supports 7-bit slave address mode.
  *
- * Pin mapping (STM8S103F3P6 TSSOP20):
- *   PB4 = I2C_SDA, PB5 = I2C_SCL  (hardware I2C, open-drain + external pull-up)
+ * Pin mapping (STM8S103F3P6 TSSOP20)，与硬件 I2C 外设的映射完全一致：
+ *   PB4 = I2C_SCL (第12脚), PB5 = I2C_SDA (第11脚)  (open-drain + external pull-up)
  *
  * Protocol (register-file style slave):
  *   - Master write: slave accumulates bytes into rx_buf; when 4 bytes
@@ -105,18 +105,18 @@
 #define I2C_ITCR_AFIE   0x04
 #define I2C_ITCR_OVRIE  0x08
 
-/* ========== GPIOB Register Addresses (PB4 = SDA, PB5 = SCL) ==========
+/* ========== GPIOB Register Addresses (PB4 = SCL, PB5 = SDA) ==========
  * PB base 0x5005: ODR+0, IDR+1, DDR+2, CR1+3, CR2+4.
  * I2C lines are open-drain: DDR=1 (output), CR1=0 (open-drain),
- * CR2=1 (10MHz slew) + external pull-up resistors required.
+ * CR2=0 (外部中断关闭，见 i2cs_init 说明) + external pull-up resistors required.
  */
 #define GPIO_PB_ODR   (*(volatile uint8_t *)0x5005)
 #define GPIO_PB_IDR   (*(volatile uint8_t *)0x5006)
 #define GPIO_PB_DDR   (*(volatile uint8_t *)0x5007)
 #define GPIO_PB_CR1   (*(volatile uint8_t *)0x5008)
 #define GPIO_PB_CR2   (*(volatile uint8_t *)0x5009)
-#define I2C_SDA_PIN   0x10     /* PB4 bit mask */
-#define I2C_SCL_PIN   0x20     /* PB5 bit mask */
+#define I2C_SCL_PIN   0x10     /* PB4 bit mask (第12脚，与硬件 I2C 的 SCL 一致) */
+#define I2C_SDA_PIN   0x20     /* PB5 bit mask (第11脚，与硬件 I2C 的 SDA 一致) */
 
 /* ========== Clock Register Addresses ========== */
 #define CLK_CKDIVR            (*(volatile uint8_t *)0x50C6)
@@ -145,8 +145,12 @@ struct I2CS {
     uint8_t  write_pending;     /* 1 = rx_buf holds a full display payload */
 
     /* --- Public methods --- */
-    void (*init)  (I2CS_t *self);                 /* configure slave, enable IRQ */
-    void (*irq)   (I2CS_t *self);                 /* I2C event/error ISR body */
+    void (*init)  (I2CS_t *self);                 /* configure PB4/PB5 as bit-bang lines */
+    void (*irq)   (I2CS_t *self);                 /* legacy HW-I2C ISR stub (no-op now) */
+    /* poll: must be called continuously from the main loop (never wfi).
+     * The bit-bang slave samples SCL/SDA by polling; one call costs only a
+     * handful of instructions, so call it as fast as the loop allows. */
+    void (*poll)  (I2CS_t *self);
 
     /* --- Callbacks (called from I2C ISR — keep them non-blocking) ---
      * onWrite: master wrote bytes; rx_buf[0..rx_len-1] holds the payload.
